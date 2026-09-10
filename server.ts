@@ -43,13 +43,13 @@ const getWorkspaceDir = (sessionId: string) => {
 // Tool Declarations for Gemini
 const terminalToolDeclaration: FunctionDeclaration = {
   name: 'execute_terminal',
-  description: 'Menjalankan perintah bash Linux nyata di dalam direktori kerja terisolasi ~/ai_workspace. Gunakan alat ini untuk memeriksa berkas, membuat file proyek, menjalankan script, build, menginstal dependensi lokal, atau memeriksa output CLI.',
+  description: 'Menjalankan perintah bash Linux nyata di ROOT workspace sesi saat ini. Proses sudah dimulai dengan cwd tepat di root workspace, jadi gunakan path relatif seperti hello.ts, src/index.ts, atau project-name/. Jangan membuat folder ai_workspace/workspace/workspaces hanya untuk mencari root karena cwd sudah merupakan root.',
   parameters: {
     type: Type.OBJECT,
     properties: {
       command: {
         type: Type.STRING,
-        description: 'Perintah bash yang akan dieksekusi di ~/ai_workspace.'
+        description: 'Perintah bash yang dieksekusi langsung dari root workspace sesi saat ini (cwd sudah benar). Gunakan path relatif terhadap root ini.'
       }
     },
     required: ['command']
@@ -548,7 +548,12 @@ app.post('/api/chat', async (req, res) => {
 
     // Mandatory grounding by default for substantive requests. Only clearly
     // non-research tasks are exempt, or when the user explicitly opts out.
-    const isClearlySimpleChat = /^(halo|hai|hi|hello|hey|test|tes|cek|oke|ok|okay|ya|iya|yup|sip|makasih|terima kasih|thanks|thank you|apa kabar|selamat (pagi|siang|sore|malam))[.!?\s]*$/i.test(normalizedMessage);
+    const normalizedSimple = normalizedMessage
+      .toLowerCase()
+      .replace(/[.!?,;:]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const isClearlySimpleChat = /^(?:halo+|hallo+|hai+|hi+|hello+|hey+)(?:\s+(?:bro|bang|kak|gan|bos|teman|chatgpt|gemini))?$|^(?:test|tes|cek|oke|ok|okay|ya|iya|yup|sip|makasih|terima kasih|thanks|thank you|apa kabar|selamat pagi|selamat siang|selamat sore|selamat malam)$/i.test(normalizedSimple);
     const isSimpleArithmetic = /^[\d\s+\-*/%^().,=]+$/.test(normalizedMessage) && /\d/.test(normalizedMessage);
     const isPureTransformation = /\b(terjemahkan|translate|parafrase|paraphrase|rewrite|tulis ulang|ringkas teks|summarize this|perbaiki kalimat|rapikan tulisan)\b/i.test(normalizedMessage);
     const isPureCreative = /\b(buatkan|bikin|tulis|ciptakan|create|write)\b.{0,80}\b(puisi|pantun|cerita pendek|short story|slogan|caption|tagline|nama karakter|dialog fiksi)\b/i.test(normalizedMessage);
@@ -566,10 +571,15 @@ app.post('/api/chat', async (req, res) => {
       !isPureTransformation &&
       !isPureCreative;
 
-    // Hybrid should not launch a full Deep Research job for clearly trivial or
-    // non-research turns. Substantive Hybrid requests still always use Deep Research.
-    const bypassHybridResearch =
-      isClearlySimpleChat || isSimpleArithmetic || isPureTransformation || isPureCreative;
+    const isHybridModel =
+      selectedModel === 'hybrid-deep-research-flash-lite' || selectedModel.startsWith('hybrid-');
+
+    // Hybrid must never launch Deep Research for clearly trivial/non-research turns.
+    // Keep this decision server-side so a greeting cannot accidentally fall through
+    // to the expensive research pipeline.
+    const bypassHybridResearch = isHybridModel && (
+      isClearlySimpleChat || isSimpleArithmetic || isPureTransformation || isPureCreative
+    );
 
     const turnPolicy: TurnPolicy = {
       requireSearch,
@@ -617,17 +627,29 @@ app.post('/api/chat', async (req, res) => {
       "3. Jika Search Grounding wajib, lakukan pencarian SEBELUM melakukan implementasi yang mengubah workspace. Cari sumber primer/resmi bila tersedia, gunakan lebih dari satu query ketika satu pencarian belum cukup, lalu sintesis temuan dengan reasoning Anda sendiri.\n" +
       "4. Pertimbangkan alternatif yang benar-benar layak. Bandingkan kompatibilitas, kelebihan, kekurangan, batasan, dan risiko sebelum memilih pendekatan.\n" +
       "5. Untuk tugas implementasi, jawaban berupa contoh kode di chat SAJA tidak dianggap selesai. Anda WAJIB menggunakan execute_terminal untuk memeriksa workspace, membuat/mengedit file nyata, lalu memverifikasi hasilnya.\n" +
-      "6. Setelah membuat atau mengubah file, WAJIB lakukan verifikasi nyata melalui execute_terminal: minimal periksa file yang berubah dan, jika tersedia, jalankan syntax check/build/test/lint/typecheck yang relevan. Jangan mengklaim berhasil tanpa exit/result tool yang mendukung klaim tersebut.\n" +
-      "7. Gunakan fetch_url ketika halaman/dokumentasi tertentu perlu dibaca langsung setelah ditemukan atau diberikan pengguna.\n" +
-      "8. Jangan mengarang hasil search, terminal, file, test, atau URL. Bedakan fakta terverifikasi, inferensi, dan hal yang masih belum pasti.\n" +
-      "9. Jika implementasi/test gagal, perlakukan error sebagai bukti baru: analisis penyebab, lakukan Search Grounding tambahan jika error membutuhkan referensi eksternal, perbaiki, lalu uji ulang.\n" +
-      "10. Jangan memberikan jawaban final prematur. Untuk turn yang memiliki kewajiban Search atau Workspace, tuntaskan kewajiban tersebut lebih dahulu.\n" +
-      "11. Patuhi batasan dan kebijakan platform yang berlaku tanpa menambahkan klasifikasi atau pembatasan buatan yang tidak diperlukan.\n\n" +
+      "6. execute_terminal SELALU dimulai tepat di ROOT workspace sesi. Gunakan path relatif dari cwd saat ini. Jangan membuat folder bernama ai_workspace, workspace, atau workspaces untuk merepresentasikan root kecuali pengguna memang meminta folder dengan nama tersebut. Jika ragu, jalankan pwd dan ls terlebih dahulu.\n" +
+      "7. Setelah membuat atau mengubah file, WAJIB lakukan verifikasi nyata melalui execute_terminal: minimal periksa file yang berubah dan, jika tersedia, jalankan syntax check/build/test/lint/typecheck yang relevan. Jangan mengklaim berhasil tanpa exit/result tool yang mendukung klaim tersebut.\n" +
+      "8. Gunakan fetch_url ketika halaman/dokumentasi tertentu perlu dibaca langsung setelah ditemukan atau diberikan pengguna.\n" +
+      "9. Jangan mengarang hasil search, terminal, file, test, atau URL. Bedakan fakta terverifikasi, inferensi, dan hal yang masih belum pasti.\n" +
+      "10. Jika implementasi/test gagal, perlakukan error sebagai bukti baru: analisis penyebab, lakukan Search Grounding tambahan jika error membutuhkan referensi eksternal, perbaiki, lalu uji ulang.\n" +
+      "11. Jangan memberikan jawaban final prematur. Untuk turn yang memiliki kewajiban Search atau Workspace, tuntaskan kewajiban tersebut lebih dahulu.\n" +
+      "12. Jangan menghabiskan reasoning untuk meta-komentar seperti menilai gaya komunikasi, mengulang instruksi pengguna, atau membahas pemeriksaan safety yang tidak relevan dengan tugas. Fokus pada bukti, keputusan teknis, eksekusi, error, dan verifikasi.\n" +
+      "13. Patuhi batasan dan kebijakan platform yang berlaku tanpa menambahkan klasifikasi atau pembatasan buatan yang tidak diperlukan.\n\n" +
       "TOOL YANG TERSEDIA:\n" +
       "- googleSearch: mencari informasi terkini dan sumber pendukung.\n" +
-      "- execute_terminal: menjalankan perintah bash Linux di workspace terisolasi.\n" +
+      "- execute_terminal: menjalankan perintah bash Linux dari ROOT workspace sesi saat ini.\n" +
       "- fetch_url: membuka URL dan membaca isi halaman.\n\n" +
       "Gunakan Bahasa Indonesia yang lugas dan natural kecuali pengguna meminta bahasa lain.";
+
+    const shouldStreamThought = (text: string) => {
+      const compact = String(text || '').trim();
+      if (!compact) return false;
+
+      // Keep useful execution/research progress, but suppress generic meta-analysis
+      // that made the UI noisy in testing without helping the user understand work.
+      const metaNoise = /assessing prompt'?s safety|verifying user instructions|analyzing communication styles|system-level policy check|ungrounded beliefs|delusion|paranoia|hallucinations|breaking down the request|interpreting system instructions/i;
+      return !metaNoise.test(compact);
+    };
 
     const agentTools = [
       { googleSearch: {} },
@@ -720,7 +742,9 @@ app.post('/api/chat', async (req, res) => {
             } catch {}
 
             if (part.thought && part.text) {
-              res.write(`data: ${JSON.stringify({ thought: part.text })}\n\n`);
+              if (shouldStreamThought(part.text)) {
+                res.write(`data: ${JSON.stringify({ thought: part.text })}\n\n`);
+              }
             } else if (part.text) {
               // Buffer normal answer text until mandatory gates are satisfied.
               pendingText += part.text;
@@ -851,47 +875,43 @@ app.post('/api/chat', async (req, res) => {
       return contents;
     };
 
-    if (selectedModel === 'hybrid-deep-research-flash-lite' && bypassHybridResearch) {
-      // Keep Hybrid responsive for greetings/simple transformations while still
-      // using the same Flash Lite executor and high-thinking configuration.
-      const simpleHybridHistory = safeHistory.map((msg: any) => ({
-        role: msg.role === 'user' ? 'user' : 'model',
-        parts: [{ text: msg.text }]
-      }));
-      const simpleHybridContextKey = getReasoningContextKey(
-        sessionId,
-        'hybrid-simple::gemini-3.5-flash-lite'
-      );
-      const storedSimpleHybridContext = getReasoningContext(simpleHybridContextKey);
-      const simpleHybridContents = storedSimpleHybridContext &&
-        storedSimpleHybridContext.expectedNextHistoryLength === safeHistory.length
-        ? [
-            ...storedSimpleHybridContext.contents,
-            { role: 'user', parts: [{ text: message }] }
-          ]
-        : [
-            ...simpleHybridHistory,
-            { role: 'user', parts: [{ text: message }] }
-          ];
+    if (isHybridModel && bypassHybridResearch) {
+      // Guaranteed simple path: no Deep Research and no tools at all. This makes
+      // greetings like "Halo" impossible to fall into Search Grounding.
+      const simpleHybridContents = [
+        ...safeHistory.map((msg: any) => ({
+          role: msg.role === 'user' ? 'user' : 'model',
+          parts: [{ text: msg.text }]
+        })),
+        { role: 'user', parts: [{ text: message }] }
+      ];
 
-      const updatedSimpleHybridContents = await runGeminiToolLoop(
-        'gemini-3.5-flash-lite',
-        simpleHybridContents,
-        6,
-        {
-          requireSearch: false,
-          requireWorkspace: false,
-          reason: 'mode hybrid: turn sederhana/non-riset, Deep Research dilewati'
+      const simpleStream = await executeStreamWithRetry(async () => {
+        return await ai.models.generateContentStream({
+          model: 'gemini-3.5-flash-lite',
+          contents: simpleHybridContents,
+          config: {
+            systemInstruction:
+              'Jawab permintaan sederhana ini secara langsung, natural, dan singkat dalam Bahasa Indonesia kecuali pengguna meminta bahasa lain. Jangan melakukan riset, jangan membahas tren terkini yang tidak diminta, jangan memanggil tool, dan jangan mengubah workspace.',
+            thinkingConfig: highThinkingConfig
+          }
+        });
+      });
+
+      for await (const chunk of simpleStream) {
+        const parts = chunk.candidates?.[0]?.content?.parts || [];
+        for (const part of parts) {
+          if (part.thought && part.text) {
+            if (shouldStreamThought(part.text)) {
+              res.write(`data: ${JSON.stringify({ thought: part.text })}\n\n`);
+            }
+          } else if (part.text) {
+            res.write(`data: ${JSON.stringify({ text: part.text })}\n\n`);
+          }
         }
-      );
+      }
 
-      saveReasoningContext(
-        simpleHybridContextKey,
-        updatedSimpleHybridContents,
-        safeHistory.length + 2
-      );
-
-    } else if (selectedModel === 'hybrid-deep-research-flash-lite') {
+    } else if (isHybridModel) {
       const historyText = safeHistory
         .map((msg: any) => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.text}`)
         .join('\n\n');
@@ -900,16 +920,19 @@ app.post('/api/chat', async (req, res) => {
       res.write(`data: ${JSON.stringify({ thought: '🧠 Deep Research: mencari bukti, sumber, dan alternatif solusi...\n' })}\n\n`);
       
       const researchInput =
-        `[TUGAS DEEP RESEARCH UNTUK HANDOFF KE AGENT EKSEKUTOR]\n` +
-        `Teliti permintaan pengguna secara mendalam sebelum implementasi/jawaban akhir. Gunakan informasi terkini dan sumber primer/resmi bila tersedia. Jangan berhenti pada satu dugaan jika ada alternatif material yang perlu dibandingkan.\n\n` +
-        `Pada hasil akhir riset, buat HANDOFF yang jelas dan padat dengan struktur berikut:\n` +
-        `1. Tujuan pengguna dan constraint penting.\n` +
-        `2. Fakta terverifikasi + sumber/URL yang relevan.\n` +
-        `3. Hal yang masih tidak pasti atau perlu diverifikasi oleh eksekutor.\n` +
-        `4. Alternatif solusi yang benar-benar layak beserta trade-off.\n` +
-        `5. Rekomendasi sementara dan alasan berbasis bukti.\n` +
-        `6. Rencana implementasi/verifikasi yang dapat dilakukan eksekutor di workspace.\n` +
-        `Handoff adalah bukti untuk eksekutor, bukan perintah mutlak: eksekutor boleh mengoreksi rekomendasi jika workspace atau verifikasi lanjutan menunjukkan hal berbeda.\n\n` +
+        `[TUGAS DEEP RESEARCH: HANDOFF RINGKAS UNTUK AGENT EKSEKUTOR]\n` +
+        `Lakukan riset TERARAH untuk permintaan pengguna. Fokus hanya pada fakta/teknologi yang benar-benar memengaruhi solusi. Prioritaskan sumber resmi/primer dan informasi terbaru.\n` +
+        `Jangan membuat file, menjalankan build/test, atau mengklaim implementasi pada tahap riset ini; eksekutor Flash Lite yang akan mengerjakan workspace.\n` +
+        `Hindari meta-analisis tentang safety, gaya komunikasi, interpretasi instruksi, atau narasi proses yang tidak relevan.\n` +
+        `Gunakan kira-kira 2-4 sumber bernilai tinggi dan hentikan pencarian ketika bukti sudah cukup, kecuali ada kontradiksi penting yang perlu diselesaikan.\n\n` +
+        `Hasil akhir harus berupa HANDOFF padat (target <= 1200 kata) dengan:\n` +
+        `1. Tujuan/constraint.\n` +
+        `2. Fakta terverifikasi + sumber/URL.\n` +
+        `3. Ketidakpastian yang tersisa.\n` +
+        `4. Alternatif utama + trade-off.\n` +
+        `5. Rekomendasi sementara.\n` +
+        `6. Langkah verifikasi yang perlu dilakukan eksekutor.\n` +
+        `Handoff adalah bukti awal, bukan perintah mutlak; eksekutor boleh mengoreksinya setelah Search Grounding independen atau pemeriksaan workspace.\n\n` +
         `[RIWAYAT PERCAKAPAN]\n${historyText || '(tidak ada)'}\n\n` +
         `[PERMINTAAN BARU]\n${message}`;
       
@@ -943,10 +966,13 @@ app.post('/api/chat', async (req, res) => {
           if (event.delta?.type === 'thought_summary' && event.delta?.content?.text) {
             const summaryText = event.delta.content.text;
             researchThoughtSummary += `${summaryText}\n`;
-            res.write(`data: ${JSON.stringify({ thought: summaryText })}\n\n`);
+            if (shouldStreamThought(summaryText)) {
+              res.write(`data: ${JSON.stringify({ thought: summaryText })}\n\n`);
+            }
           } else if (event.delta?.type === 'text' && event.delta?.text) {
+            // Keep the final handoff for Flash Lite, but do not mirror the entire
+            // research report into the visible thought panel.
             researchResult += event.delta.text;
-            res.write(`data: ${JSON.stringify({ thought: event.delta.text })}\n\n`);
           }
         }
 
@@ -975,7 +1001,7 @@ app.post('/api/chat', async (req, res) => {
       const flashInput =
         `Anda adalah eksekutor/engineer akhir dari mode hybrid. Baca handoff Deep Research di bawah sebagai bukti awal, BUKAN sebagai kesimpulan yang wajib diikuti.\n` +
         `WAJIB lakukan Google Search Grounding independen minimal satu ronde untuk memverifikasi poin penting dari handoff sebelum menetapkan solusi final. Jangan hanya mempercayai atau merangkum hasil Deep Research. Prioritaskan sumber resmi/primer dan lakukan query tambahan jika hasil pertama belum cukup.\n` +
-        `Setelah verifikasi search, hubungkan hasil riset dengan permintaan pengguna dan kondisi workspace nyata. Untuk tugas implementasi, inspect workspace, kerjakan dengan execute_terminal, lalu verifikasi file dan jalankan syntax check/build/test/lint/typecheck yang relevan. Jawaban kode di chat saja tidak dianggap implementasi.\n` +
+        `Setelah verifikasi search, hubungkan hasil riset dengan permintaan pengguna dan kondisi workspace nyata. Untuk tugas implementasi, inspect workspace, kerjakan dengan execute_terminal, lalu verifikasi file dan jalankan syntax check/build/test/lint/typecheck yang relevan. execute_terminal sudah berada tepat di ROOT workspace; gunakan path relatif dan jangan membuat ai_workspace/workspace/workspaces sebagai root buatan. Jawaban kode di chat saja tidak dianggap implementasi.\n` +
         `Jika search independen atau kondisi workspace menunjukkan rekomendasi riset tidak cocok, koreksi pendekatan dan jelaskan hasil akhirnya berdasarkan bukti terbaru.\n\n` +
         `[PERMINTAAN PENGGUNA]\n${message}\n\n` +
         `[HANDOFF DEEP RESEARCH]\n${researchHandoff || '(Deep Research tidak menghasilkan handoff teks; lakukan verifikasi mandiri dengan tool.)'}`;
@@ -1044,7 +1070,9 @@ app.post('/api/chat', async (req, res) => {
       for await (const event of stream) {
         if (event.event_type === 'step.delta') {
           if (event.delta?.type === 'thought_summary' && event.delta?.content?.text) {
-            res.write(`data: ${JSON.stringify({ thought: event.delta.content.text })}\n\n`);
+            if (shouldStreamThought(event.delta.content.text)) {
+              res.write(`data: ${JSON.stringify({ thought: event.delta.content.text })}\n\n`);
+            }
           } else if (event.delta?.type === 'text' && event.delta?.text) {
             res.write(`data: ${JSON.stringify({ text: event.delta.text })}\n\n`);
           }
