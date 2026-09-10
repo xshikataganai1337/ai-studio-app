@@ -12,6 +12,7 @@ import { ThoughtAccordion } from './components/ThoughtAccordion';
 import { CodeBlock } from './components/CodeBlock';
 import { GroundingSources, GroundingSource } from './components/GroundingSources';
 import { formatMarkdown, extractSourcesFromText } from './utils/markdownUtils';
+import { AVAILABLE_MODELS, getFallbackChain } from './modelConfig';
 
 type Message = {
   id: string;
@@ -58,20 +59,6 @@ const CopyResponseButton: React.FC<{ text: string }> = ({ text }) => {
   );
 };
 
-const AVAILABLE_MODELS = [
-  { id: 'hybrid-deep-research-flash-lite', label: 'Hybrid (Deep Research + Flash Lite)' },
-  { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
-  { id: 'antigravity-preview-05-2026', label: 'Antigravity 05-26' },
-  { id: 'gemini-3.1-pro-preview-customtools', label: 'Gemini 3.1 Custom' },
-  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
-  { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
-  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
-  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
-  { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },
-  { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite' },
-  { id: 'gemini-3-flash-preview', label: 'Gemini 3.0 Flash Prev' }
-];
-
 type ChatSession = {
   id: string;
   title: string;
@@ -79,10 +66,16 @@ type ChatSession = {
   timestamp: number;
 };
 
+const SESSION_PERSIST_INTERVAL_MS = 1200;
+
 export default function App() {
   const [sessions, setSessions] = useState<ChatSession[]>(() => {
     const saved = localStorage.getItem('ai_sessions');
-    return saved ? JSON.parse(saved) : [];
+    try {
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
   });
   
   const [currentSessionId, setCurrentSessionId] = useState<string>(() => {
@@ -94,9 +87,13 @@ export default function App() {
     const savedSessions = localStorage.getItem('ai_sessions');
     const savedCurrent = localStorage.getItem('ai_current_session');
     if (savedSessions && savedCurrent) {
-      const parsed = JSON.parse(savedSessions) as ChatSession[];
-      const current = parsed.find(s => s.id === savedCurrent);
-      if (current) return current.messages;
+      try {
+        const parsed = JSON.parse(savedSessions) as ChatSession[];
+        const current = parsed.find(s => s.id === savedCurrent);
+        if (current) return current.messages;
+      } catch {
+        // Ignore corrupted browser persistence and start clean.
+      }
     }
     return [];
   });
@@ -170,11 +167,11 @@ export default function App() {
     }
   };
 
+  // The server now emits workspaceChanged after terminal activity, so the file
+  // explorer only fetches on open/session change and on actual agent activity.
   useEffect(() => {
     if (isRightSidebarOpen && currentSessionId) {
-      fetchWorkspaceFiles();
-      const interval = setInterval(fetchWorkspaceFiles, 2000);
-      return () => clearInterval(interval);
+      void fetchWorkspaceFiles();
     }
   }, [isRightSidebarOpen, currentSessionId]);
 
@@ -205,6 +202,8 @@ export default function App() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const userScrolledUpRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastPersistAtRef = useRef(0);
 
   const handleStopGeneration = () => {
     if (abortControllerRef.current) {
@@ -213,6 +212,8 @@ export default function App() {
     }
   };
 
+  // Keep React state current on every streamed update, but do not stringify and
+  // rewrite the full session history to localStorage on every token/chunk.
   useEffect(() => {
     setSessions(prev => {
       let nextSessions = prev;
@@ -226,11 +227,41 @@ export default function App() {
         nextSessions = [{ id: currentSessionId, title, messages, timestamp: Date.now() }, ...prev];
       }
       
-      localStorage.setItem('ai_sessions', JSON.stringify(nextSessions));
       return nextSessions;
     });
     localStorage.setItem('ai_current_session', currentSessionId);
   }, [messages, currentSessionId]);
+
+  // During streaming this behaves like a trailing throttle (roughly once every
+  // 1.2s). When generation stops, the final state is persisted immediately.
+  useEffect(() => {
+    if (persistTimerRef.current) {
+      clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+
+    const persist = () => {
+      localStorage.setItem('ai_sessions', JSON.stringify(sessions));
+      lastPersistAtRef.current = Date.now();
+      persistTimerRef.current = null;
+    };
+
+    const elapsed = Date.now() - lastPersistAtRef.current;
+    const delay = isLoading ? Math.max(0, SESSION_PERSIST_INTERVAL_MS - elapsed) : 0;
+
+    if (delay === 0) {
+      persist();
+    } else {
+      persistTimerRef.current = setTimeout(persist, delay);
+    }
+
+    return () => {
+      if (persistTimerRef.current) {
+        clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+    };
+  }, [sessions, isLoading]);
 
   const handleEditLastMessage = () => {
     if (isLoading) return;
@@ -324,6 +355,7 @@ export default function App() {
     setSessions((prev) => {
       const updated = prev.filter((s) => s.id !== sessionIdToDelete);
       localStorage.setItem('ai_sessions', JSON.stringify(updated));
+      lastPersistAtRef.current = Date.now();
       return updated;
     });
 
@@ -366,14 +398,16 @@ export default function App() {
       { id: tempModelMessageId, role: 'model', text: '', thought: '' },
     ]);
 
-    const totalModels = AVAILABLE_MODELS.length;
-    let currentModelId = selectedModel;
-    let modelAttemptCount = 0;
+    // Fallbacks stay within compatible model families/modes. Hybrid and
+    // Antigravity never silently degrade into a different execution pipeline.
+    const fallbackChain = getFallbackChain(selectedModel);
+    let currentModelId = fallbackChain[0];
+    let modelAttemptIndex = 0;
     let cumulativeWarning = '';
     let globalSuccess = false;
 
     try {
-      while (modelAttemptCount < totalModels) {
+      while (modelAttemptIndex < fallbackChain.length) {
         let isSuccess = false;
         let attemptForCurrentModel = 0;
 
@@ -479,6 +513,11 @@ export default function App() {
                             };
                             scheduleUpdate();
                           }
+                        } else if (parsed.workspaceChanged) {
+                          const changedSessionId = parsed.workspaceChanged.sessionId;
+                          if (!changedSessionId || changedSessionId === currentSessionId) {
+                            void fetchWorkspaceFiles();
+                          }
                         }
                       } catch (e) {
                         // Ignore incomplete JSON chunks parsing
@@ -526,25 +565,22 @@ export default function App() {
 
         if (isSuccess) {
           break; // Break the fallback loop, successful response
-        } else {
-          modelAttemptCount++;
-          if (modelAttemptCount < totalModels) {
-            const currentIndex = AVAILABLE_MODELS.findIndex(m => m.id === currentModelId);
-            const nextIndex = (currentIndex + 1) % totalModels;
-            currentModelId = AVAILABLE_MODELS[nextIndex].id;
-            setSelectedModel(currentModelId); // Update UI selection state
-            cumulativeWarning += `> [Sistem] Terjadi gangguan pada model sebelumnya. Beralih ke model: **${currentModelId}**...\n\n`;
-            
-            setMessages((prev) =>
-              prev.map((msg) =>
-                msg.id === tempModelMessageId
-                  ? { ...msg, text: cumulativeWarning }
-                  : msg
-              )
-            );
-            
-            await new Promise(resolve => setTimeout(resolve, 500)); // Brief pause for UI transition
-          }
+        }
+
+        modelAttemptIndex++;
+        if (modelAttemptIndex < fallbackChain.length) {
+          currentModelId = fallbackChain[modelAttemptIndex];
+          cumulativeWarning += `> [Sistem] Terjadi gangguan pada model sebelumnya. Mencoba fallback kompatibel: **${currentModelId}**...\n\n`;
+          
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === tempModelMessageId
+                ? { ...msg, text: cumulativeWarning }
+                : msg
+            )
+          );
+          
+          await new Promise(resolve => setTimeout(resolve, 500)); // Brief pause for UI transition
         }
       } // End fallback loop
 
@@ -552,7 +588,7 @@ export default function App() {
         setMessages((prev) =>
           prev.map((msg) =>
             msg.id === tempModelMessageId
-              ? { ...msg, text: cumulativeWarning + '\n\n[Sistem] Semua model gagal merespons. Terjadi kesalahan pada server atau jaringan.' }
+              ? { ...msg, text: cumulativeWarning + '\n\n[Sistem] Semua fallback kompatibel gagal merespons. Terjadi kesalahan pada server atau jaringan.' }
               : msg
           )
         );
@@ -1123,5 +1159,3 @@ export default function App() {
     </div>
   );
 }
-
-
