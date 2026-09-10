@@ -6,6 +6,8 @@ import { spawn } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 import { GoogleAuth } from 'google-auth-library';
 import { GoogleGenAI, Type, FunctionDeclaration } from '@google/genai';
+import { getReasoningContextKey, getReasoningContext, saveReasoningContext, clearReasoningContextsForSession } from './server/reasoningContext';
+import { snapshotWorkspaceState, diffWorkspaceStates, shouldSkipWorkspaceDir } from './server/workspaceState';
 
 const app = express();
 const PORT = 3000;
@@ -21,46 +23,7 @@ const auth = new GoogleAuth({
   ]
 });
 
-// Preserve raw Gemini content parts (including thought signatures/tool context)
-// across consecutive chat turns while this runtime is alive. The frontend history
-// remains the source of truth: if its length no longer matches the expected next
-// turn (for example after switching model/chat), the cached reasoning context is
-// discarded and rebuilt from visible history.
-type ReasoningContextState = {
-  contents: any[];
-  expectedNextHistoryLength: number;
-  updatedAt: number;
-};
-
-const reasoningContextBySession = new Map<string, ReasoningContextState>();
-const MAX_REASONING_CONTEXTS = 64;
-
-const getReasoningContextKey = (sessionId: string, model: string) => `${sessionId}::${model}`;
-
-const saveReasoningContext = (
-  key: string,
-  contents: any[],
-  expectedNextHistoryLength: number
-) => {
-  reasoningContextBySession.set(key, {
-    contents,
-    expectedNextHistoryLength,
-    updatedAt: Date.now()
-  });
-
-  if (reasoningContextBySession.size > MAX_REASONING_CONTEXTS) {
-    const oldest = [...reasoningContextBySession.entries()]
-      .sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0];
-    if (oldest) reasoningContextBySession.delete(oldest[0]);
-  }
-};
-
-const clearReasoningContextsForSession = (sessionId: string) => {
-  const prefix = `${sessionId}::`;
-  for (const key of reasoningContextBySession.keys()) {
-    if (key.startsWith(prefix)) reasoningContextBySession.delete(key);
-  }
-};
+// Reasoning context storage/compaction lives in server/reasoningContext.ts.
 
 // Clear out the AI Studio injected API key so the SDK doesn't send both API Key and Bearer Token
 delete process.env.GEMINI_API_KEY;
@@ -214,6 +177,14 @@ function runTerminalCommand(
             id,
             type: 'end',
             exitCode
+          }
+        })}\n\n`);
+        // Let the frontend refresh the explorer only when terminal activity
+        // completes instead of polling the full workspace every two seconds.
+        res.write(`data: ${JSON.stringify({
+          workspaceChanged: {
+            sessionId,
+            timestamp: Date.now()
           }
         })}\n\n`);
       }
@@ -390,12 +361,19 @@ app.get('/api/workspace-files', async (req, res) => {
     }
     const workspaceDir = getWorkspaceDir(sessionId);
 
+    let listedItems = 0;
+    const MAX_WORKSPACE_TREE_ITEMS = 1200;
+
     async function readDirTree(dir: string, relativePath = ''): Promise<any[]> {
+      if (listedItems >= MAX_WORKSPACE_TREE_ITEMS) return [];
       const items = await fsPromises.readdir(dir, { withFileTypes: true });
       const tree: any[] = [];
       
       for (const item of items) {
+        if (listedItems >= MAX_WORKSPACE_TREE_ITEMS) break;
         if (item.name.startsWith('.')) continue; // skip hidden files
+        if (item.isDirectory() && shouldSkipWorkspaceDir(item.name)) continue;
+        listedItems++;
         
         const itemPath = path.join(dir, item.name);
         const itemRelPath = path.join(relativePath, item.name);
@@ -588,6 +566,11 @@ app.post('/api/chat', async (req, res) => {
       !isPureTransformation &&
       !isPureCreative;
 
+    // Hybrid should not launch a full Deep Research job for clearly trivial or
+    // non-research turns. Substantive Hybrid requests still always use Deep Research.
+    const bypassHybridResearch =
+      isClearlySimpleChat || isSimpleArithmetic || isPureTransformation || isPureCreative;
+
     const turnPolicy: TurnPolicy = {
       requireSearch,
       requireWorkspace,
@@ -596,54 +579,6 @@ app.post('/api/chat', async (req, res) => {
         : requireSearch
           ? 'permintaan substantif yang harus diverifikasi dengan sumber eksternal'
           : 'permintaan sederhana/non-riset'
-    };
-
-    const snapshotWorkspaceState = () => {
-      const root = getWorkspaceDir(sessionId);
-      const state = new Map<string, string>();
-      const skippedDirs = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', '.cache']);
-      let seen = 0;
-      const MAX_FILES = 800;
-
-      const walk = (dir: string) => {
-        if (seen >= MAX_FILES) return;
-        let entries: fs.Dirent[] = [];
-        try {
-          entries = fs.readdirSync(dir, { withFileTypes: true });
-        } catch {
-          return;
-        }
-
-        for (const entry of entries) {
-          if (seen >= MAX_FILES) break;
-          if (entry.isDirectory() && skippedDirs.has(entry.name)) continue;
-          const full = path.join(dir, entry.name);
-          if (entry.isDirectory()) {
-            walk(full);
-          } else if (entry.isFile()) {
-            try {
-              const stat = fs.statSync(full);
-              const rel = path.relative(root, full).replace(/\\/g, '/');
-              state.set(rel, `${stat.size}:${Math.floor(stat.mtimeMs)}`);
-              seen++;
-            } catch {}
-          }
-        }
-      };
-
-      walk(root);
-      return state;
-    };
-
-    const diffWorkspaceStates = (before: Map<string, string>, after: Map<string, string>) => {
-      const changed = new Set<string>();
-      for (const [file, fingerprint] of after.entries()) {
-        if (before.get(file) !== fingerprint) changed.add(file);
-      }
-      for (const file of before.keys()) {
-        if (!after.has(file)) changed.add(file);
-      }
-      return [...changed];
     };
 
     const looksLikeVerificationCommand = (command: string) => {
@@ -671,7 +606,7 @@ app.post('/api/chat', async (req, res) => {
       const mutating = /(?:^|\s)(?:rm|mv|cp|mkdir|touch|install)\s|\bsed\s+-i\b|\btee\b|(?:^|[^>])>{1,2}(?!>)/.test(cmd);
       if (mutating) return false;
 
-      return /(?:^|[;&|]\s*)(?:ls\b|find\b|stat\b|test\s+-[efd]\b|tree\b|wc\b|git\s+(?:diff|status)\b|head\b|tail\b|grep\b)/.test(cmd);
+      return /(?:^|[;&|]\s*)(?:ls\b|find\b|stat\b|test\s+-[efd]\b|tree\b|wc\b|git\s+(?:diff|status)\b|head\b|tail\b|grep\b|cat\b|sed\s+-n\b)/.test(cmd);
     };
 
     const agentInstruction =
@@ -721,7 +656,9 @@ app.post('/api/chat', async (req, res) => {
       let terminalUsed = false;
       let finalTextEmitted = false;
       let verificationSnapshot: Map<string, string> | null = null;
-      const baselineWorkspace = policy.requireWorkspace ? snapshotWorkspaceState() : null;
+      const baselineWorkspace = policy.requireWorkspace
+        ? await snapshotWorkspaceState(getWorkspaceDir(sessionId))
+        : null;
 
       const policyInstruction =
         `${agentInstruction}\n\n` +
@@ -838,7 +775,7 @@ app.post('/api/chat', async (req, res) => {
               });
 
               if (looksLikeVerificationCommand(command) && execResult.exitCode === 0) {
-                verificationSnapshot = snapshotWorkspaceState();
+                verificationSnapshot = await snapshotWorkspaceState(getWorkspaceDir(sessionId));
               }
             } else if (fc.name === 'fetch_url') {
               const url = fc.args?.url || '';
@@ -872,7 +809,7 @@ app.post('/api/chat', async (req, res) => {
         }
 
         if (policy.requireWorkspace && baselineWorkspace) {
-          const currentWorkspace = snapshotWorkspaceState();
+          const currentWorkspace = await snapshotWorkspaceState(getWorkspaceDir(sessionId));
           const changedFiles = diffWorkspaceStates(baselineWorkspace, currentWorkspace);
 
           if (!terminalUsed || changedFiles.length === 0) {
@@ -914,7 +851,47 @@ app.post('/api/chat', async (req, res) => {
       return contents;
     };
 
-    if (selectedModel === 'hybrid-deep-research-flash-lite') {
+    if (selectedModel === 'hybrid-deep-research-flash-lite' && bypassHybridResearch) {
+      // Keep Hybrid responsive for greetings/simple transformations while still
+      // using the same Flash Lite executor and high-thinking configuration.
+      const simpleHybridHistory = safeHistory.map((msg: any) => ({
+        role: msg.role === 'user' ? 'user' : 'model',
+        parts: [{ text: msg.text }]
+      }));
+      const simpleHybridContextKey = getReasoningContextKey(
+        sessionId,
+        'hybrid-simple::gemini-3.5-flash-lite'
+      );
+      const storedSimpleHybridContext = getReasoningContext(simpleHybridContextKey);
+      const simpleHybridContents = storedSimpleHybridContext &&
+        storedSimpleHybridContext.expectedNextHistoryLength === safeHistory.length
+        ? [
+            ...storedSimpleHybridContext.contents,
+            { role: 'user', parts: [{ text: message }] }
+          ]
+        : [
+            ...simpleHybridHistory,
+            { role: 'user', parts: [{ text: message }] }
+          ];
+
+      const updatedSimpleHybridContents = await runGeminiToolLoop(
+        'gemini-3.5-flash-lite',
+        simpleHybridContents,
+        6,
+        {
+          requireSearch: false,
+          requireWorkspace: false,
+          reason: 'mode hybrid: turn sederhana/non-riset, Deep Research dilewati'
+        }
+      );
+
+      saveReasoningContext(
+        simpleHybridContextKey,
+        updatedSimpleHybridContents,
+        safeHistory.length + 2
+      );
+
+    } else if (selectedModel === 'hybrid-deep-research-flash-lite') {
       const historyText = safeHistory
         .map((msg: any) => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.text}`)
         .join('\n\n');
@@ -1007,7 +984,7 @@ app.post('/api/chat', async (req, res) => {
         sessionId,
         'hybrid-deep-research-flash-lite::gemini-3.5-flash-lite'
       );
-      const storedHybridContext = reasoningContextBySession.get(hybridContextKey);
+      const storedHybridContext = getReasoningContext(hybridContextKey);
 
       const flashContents = storedHybridContext &&
         storedHybridContext.expectedNextHistoryLength === safeHistory.length
@@ -1089,7 +1066,7 @@ app.post('/api/chat', async (req, res) => {
       }));
 
       const contextKey = getReasoningContextKey(sessionId, selectedModel);
-      const storedContext = reasoningContextBySession.get(contextKey);
+      const storedContext = getReasoningContext(contextKey);
 
       const contents = storedContext &&
         storedContext.expectedNextHistoryLength === safeHistory.length
